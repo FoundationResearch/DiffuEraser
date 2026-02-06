@@ -322,8 +322,10 @@ class DiffuEraser:
         timesteps = torch.tensor([0], device=self.device)
         timesteps = timesteps.long()
 
-        validation_masks_input_ori = copy.deepcopy(validation_masks_input)
-        resized_frames_ori = copy.deepcopy(resized_frames)
+        # NOTE: we only re-assign list elements later (no in-place mutation of PIL images),
+        # so shallow copies are enough and avoid expensive deep copies for long videos.
+        validation_masks_input_ori = list(validation_masks_input)
+        resized_frames_ori = list(resized_frames)
         ################  Pre-inference  ################
         if n_total_frames > nframes*2: ## do pre-inference only when number of input frames is larger than nframes*2
             ## sample
@@ -371,7 +373,7 @@ class DiffuEraser:
                 latents[index] = latents_pre_out[i]
                 validation_masks_input[index] = black_image
                 validation_images_input[index] = images_pre_out[i]
-                resized_frames[index] = images_pre_out[i]
+                # `resized_frames` is not used after pre-inference; avoid redundant assignment.
         else:
             latents_pre_out=None
             sample_index=None
