@@ -706,6 +706,22 @@ class StableDiffusionDiffuEraserPipelineStageOne(
         do_classifier_free_guidance=False,
         guess_mode=False,
     ):
+        # Same optimization as `pipeline_diffueraser.py`: batch preprocess + single H2D copy.
+        if isinstance(images, (list, tuple)) and len(images) > 0 and all(not isinstance(im, torch.Tensor) for im in images):
+            images_cpu = self.image_processor.preprocess(images, height=height, width=width).to(dtype=torch.float32)
+            if images_cpu.dim() == 4:
+                repeat_by = batch_size
+                images_cpu = images_cpu.repeat_interleave(repeat_by, dim=0)
+
+                if device.type == "cuda":
+                    images_cpu = images_cpu.contiguous().pin_memory()
+                    images_all = images_cpu.to(device=device, dtype=dtype, non_blocking=True)
+                else:
+                    images_all = images_cpu.to(device=device, dtype=dtype)
+
+                t = len(images)
+                return [images_all[i * repeat_by : (i + 1) * repeat_by] for i in range(t)]
+
         images_new = []
         for image in images:
             image = self.image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)

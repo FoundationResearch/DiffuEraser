@@ -738,6 +738,35 @@ class StableDiffusionDiffuEraserPipeline(
         do_classifier_free_guidance=False,
         guess_mode=False,
     ):
+        # Fast path: common case is a list/tuple of PIL images (video frames).
+        # Avoid Python loop with per-frame `.to(device)` by doing:
+        # 1) batch preprocess on CPU
+        # 2) (optional) pin memory
+        # 3) single H2D copy
+        # 4) split back into list-of-tensors to keep downstream interface unchanged
+        if isinstance(images, (list, tuple)) and len(images) > 0 and all(not isinstance(im, torch.Tensor) for im in images):
+            images_cpu = self.image_processor.preprocess(images, height=height, width=width).to(dtype=torch.float32)  # [T,C,H,W] on CPU
+            # In this pipeline we expect each element to represent a single image (batch=1).
+            # If not, fall back to the original slow path for safety.
+            if images_cpu.dim() != 4:
+                images_cpu = None
+
+            if images_cpu is not None:
+                repeat_by = batch_size  # each frame is a single image => repeat by batch_size
+                images_cpu = images_cpu.repeat_interleave(repeat_by, dim=0)  # [T*repeat_by,C,H,W]
+
+                if device.type == "cuda":
+                    images_cpu = images_cpu.contiguous().pin_memory()
+                    images_all = images_cpu.to(device=device, dtype=dtype, non_blocking=True)
+                else:
+                    images_all = images_cpu.to(device=device, dtype=dtype)
+
+                # split back to list: each element is [repeat_by,C,H,W]
+                t = len(images)
+                images_new = [images_all[i * repeat_by : (i + 1) * repeat_by] for i in range(t)]
+                return images_new
+
+        # Slow/compatible path: preserve original behavior for odd inputs
         images_new = []
         for image in images:
             image = self.image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
