@@ -181,13 +181,21 @@ class Propainter:
                 input_frames=None,
                 input_fps=None,
                 empty_cache: bool = True,
-                profile: bool = False):
+                profile: bool = False,
+                profile_sync: bool = False,
+                profile_log_path: str = None):
         
         t0 = time.perf_counter()
         def log(msg: str):
             if profile:
+                if profile_sync and self.device.type == "cuda":
+                    torch.cuda.synchronize()
                 dt = time.perf_counter() - t0
-                print(f"[ProPainter][{dt:8.3f}s] {msg}")
+                line = f"[ProPainter][{dt:8.3f}s] {msg}"
+                print(line)
+                if profile_log_path:
+                    with open(profile_log_path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
 
         def maybe_empty_cache():
             if empty_cache and self.device.type == "cuda":

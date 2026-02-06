@@ -287,15 +287,23 @@ class DiffuEraser:
                 nframes=22, seed=None, revision = None, guidance_scale=None, blended=True,
                 input_fps=None,
                 empty_cache: bool = True,
-                profile: bool = False):
+                profile: bool = False,
+                profile_sync: bool = False,
+                profile_log_path: str = None):
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
 
         t0 = time.perf_counter()
         def log(msg: str):
             if profile:
+                if profile_sync and torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 dt = time.perf_counter() - t0
-                print(f"[DiffuEraser][{dt:8.3f}s] {msg}")
+                line = f"[DiffuEraser][{dt:8.3f}s] {msg}"
+                print(line)
+                if profile_log_path:
+                    with open(profile_log_path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
 
         def maybe_empty_cache():
             if empty_cache and torch.cuda.is_available():
@@ -310,20 +318,24 @@ class DiffuEraser:
         if (max_img_size<256 or max_img_size>1920):
             raise ValueError("The max_img_size must be larger than 256, smaller than 1920.")
 
-        ################ read input video ################ 
+        ################ read input video ################
+        log("read_video: start")
         frames, fps, img_size, n_clip, n_total_frames = read_video(
             validation_image, video_length, nframes, max_img_size, fps_override=input_fps
         )
         video_len = len(frames)
+        log(f"read_video: done (frames={video_len}, fps={fps}, img_size={img_size}, n_clip={n_clip})")
         log(f"video read: frames={video_len}, fps={fps}, img_size={img_size}, n_clip={n_clip}")
 
         ################     read mask    ################ 
+        log("read_mask: start")
         validation_masks_input, validation_images_input = read_mask(validation_mask, fps, video_len, img_size, mask_dilation_iter, frames)
-        log("mask read + dilation done")
+        log("read_mask: done")
   
         ################    read priori   ################  
+        log("read_priori: start")
         prioris = read_priori(priori, fps, n_total_frames, img_size)
-        log("priori ready")
+        log(f"read_priori: done (frames={len(prioris)})")
 
         ## recheck
         n_total_frames = min(min(len(frames), len(validation_masks_input)), len(prioris))
@@ -367,20 +379,24 @@ class DiffuEraser:
         noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=n_clip)[:real_video_length,...]
         
         ################  prepare priori  ################
+        log("prepare_priori(preprocess): start")
         images_preprocessed = []
         for image in prioris:
             image = self.image_processor.preprocess(image, height=tar_height, width=tar_width).to(dtype=torch.float32)
             image = image.to(device=torch.device(self.device), dtype=torch.float16)
             images_preprocessed.append(image)
         pixel_values = torch.cat(images_preprocessed)
+        log("prepare_priori(preprocess): done")
 
         with torch.no_grad():
+            log("prepare_priori(vae.encode): start")
             pixel_values = pixel_values.to(dtype=torch.float16)
             latents = []
             num=4
             for i in range(0, pixel_values.shape[0], num):
                 latents.append(self.vae.encode(pixel_values[i : i + num]).latent_dist.sample())
             latents = torch.cat(latents, dim=0)
+            log("prepare_priori(vae.encode): done")
         latents = latents * self.vae.config.scaling_factor #[(b f), c1, h, w], c1=4
         maybe_empty_cache()
         timesteps = torch.tensor([0], device=self.device)
@@ -405,6 +421,7 @@ class DiffuEraser:
             latents_pre = noisy_latents_pre
 
             with torch.no_grad():
+                log("pre_infer(pipeline.latents): start")
                 latents_pre_out = self.pipeline(
                     num_frames=nframes, 
                     prompt=validation_prompt, 
@@ -415,6 +432,7 @@ class DiffuEraser:
                     guidance_scale=guidance_scale_final,
                     latents=latents_pre,
                 ).latents
+                log("pre_infer(pipeline.latents): done")
             maybe_empty_cache()
 
             def decode_latents(latents, weight_dtype, batch_size: int = 8):
@@ -427,7 +445,9 @@ class DiffuEraser:
                 # keep float32 for postprocess compatibility
                 return video.float()
             with torch.no_grad():
+                log("pre_infer(vae.decode): start")
                 video_tensor_temp = decode_latents(latents_pre_out, weight_dtype=torch.float16)
+                log("pre_infer(vae.decode): done")
                 images_pre_out  = self.image_processor.postprocess(video_tensor_temp, output_type="pil")
             maybe_empty_cache()
 
@@ -449,6 +469,7 @@ class DiffuEraser:
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps) 
         latents = noisy_latents
         with torch.no_grad():
+            log("infer(pipeline.frames): start")
             images = self.pipeline(
                 num_frames=nframes, 
                 prompt=validation_prompt, 
@@ -459,12 +480,14 @@ class DiffuEraser:
                 guidance_scale=guidance_scale_final,
                 latents=latents,
             ).frames
+            log("infer(pipeline.frames): done")
         images = images[:real_video_length]
 
         maybe_gc()
         maybe_empty_cache()
 
         ################ Compose ################
+        log(f"compose: start (blended={blended})")
         binary_masks = validation_masks_input_ori
         mask_blurreds = []
         if blended:
@@ -481,6 +504,7 @@ class DiffuEraser:
             img = (np.array(images[i]).astype(np.uint8) * mask \
                 + np.array(resized_frames_ori[i]).astype(np.uint8) * (1 - mask)).astype(np.uint8)
             comp_frames.append(Image.fromarray(img))
+        log("compose: comp_frames ready")
 
         default_fps = fps
         writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
@@ -489,6 +513,7 @@ class DiffuEraser:
             img = np.array(comp_frames[f]).astype(np.uint8)
             writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         writer.release()
+        log("compose: video written")
         ################################
 
         return output_path
