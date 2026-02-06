@@ -75,14 +75,34 @@ def binary_mask(mask, th=0.1):
     return mask
   
 # read frame-wise masks
-def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
+def _dilate_binary_mask_opencv(mask_u8: np.ndarray, iterations: int) -> np.ndarray:
+    """
+    Fast binary dilation on CPU using OpenCV.
+    We use a cross-shaped 3x3 kernel to better match scipy.ndimage.binary_dilation default connectivity=1.
+    Returns uint8 array with values {0,1}.
+    """
+    if iterations <= 0:
+        return (mask_u8 > 0).astype(np.uint8)
+    m = (mask_u8 > 0).astype(np.uint8)
+    kernel = np.array([[0, 1, 0],
+                       [1, 1, 1],
+                       [0, 1, 0]], dtype=np.uint8)
+    m = cv2.dilate(m, kernel, iterations=int(iterations))
+    return m.astype(np.uint8)
+
+
+def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5, use_opencv: bool = True):
     masks_img = []
     masks_dilated = []
     flow_masks = []
     
-    if mpath.endswith(('jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG')): # input single img path
+    # In-memory masks: list/tuple of PIL/np arrays (already decoded elsewhere)
+    if isinstance(mpath, (list, tuple)):
+        masks_img = list(mpath)[:frames_len]
+        masks_img = [m if isinstance(m, Image.Image) else Image.fromarray(np.asarray(m)) for m in masks_img]
+    elif mpath.endswith(('jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG')):  # input single img path
         masks_img = [Image.open(mpath)]
-    elif mpath.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
+    elif mpath.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')):  # input video path
         cap = cv2.VideoCapture(mpath)
         if not cap.isOpened():
             print("Error: Could not open video.")
@@ -90,18 +110,17 @@ def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
         idx = 0
         while True:
             ret, frame = cap.read()
-            if not ret: 
+            if not ret:
                 break
-            if(idx >= frames_len):
+            if idx >= frames_len:
                 break
             masks_img.append(Image.fromarray(frame))
             idx += 1
         cap.release()
-    else:  
+    else:
         mnames = sorted(os.listdir(mpath))
         for mp in mnames:
             masks_img.append(Image.open(os.path.join(mpath, mp)))
-            # print(mp)
           
     for mask_img in masks_img:
         if size is not None:
@@ -110,7 +129,10 @@ def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
 
         # Dilate 8 pixel so that all known pixel is trustworthy
         if flow_mask_dilates > 0:
-            flow_mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=flow_mask_dilates).astype(np.uint8)
+            if use_opencv:
+                flow_mask_img = _dilate_binary_mask_opencv(mask_img, iterations=flow_mask_dilates)
+            else:
+                flow_mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=flow_mask_dilates).astype(np.uint8)
         else:
             flow_mask_img = binary_mask(mask_img).astype(np.uint8)
         # Close the small holes inside the foreground objects
@@ -119,7 +141,10 @@ def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
         flow_masks.append(Image.fromarray(flow_mask_img * 255))
         
         if mask_dilates > 0:
-            mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=mask_dilates).astype(np.uint8)
+            if use_opencv:
+                mask_img = _dilate_binary_mask_opencv(mask_img, iterations=mask_dilates)
+            else:
+                mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=mask_dilates).astype(np.uint8)
         else:
             mask_img = binary_mask(mask_img).astype(np.uint8)
         masks_dilated.append(Image.fromarray(mask_img * 255))
@@ -186,7 +211,10 @@ class Propainter:
                 empty_cache: bool = True,
                 profile: bool = False,
                 profile_sync: bool = False,
-                profile_log_path: str = None):
+                profile_log_path: str = None,
+                pin_memory: bool = True,
+                non_blocking: bool = True,
+                use_opencv_mask_dilate: bool = True):
         
         t0 = time.perf_counter()
         def log(msg: str):
@@ -254,9 +282,10 @@ class Propainter:
 
         ################ read mask ################ 
         frames_len = len(frames)
-        flow_masks, masks_dilated = read_mask(mask, frames_len, size, 
+        flow_masks, masks_dilated = read_mask(mask, frames_len, size,
                                             flow_mask_dilates=mask_dilation,
-                                            mask_dilates=mask_dilation)
+                                            mask_dilates=mask_dilation,
+                                            use_opencv=use_opencv_mask_dilate)
         flow_masks = flow_masks[:nframes]
         masks_dilated = masks_dilated[:nframes]
         w, h = size
@@ -268,11 +297,40 @@ class Propainter:
         flow_masks = flow_masks[:frames_len]
         masks_dilated = masks_dilated[:frames_len]
         
-        ori_frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-        frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
-        flow_masks = to_tensors()(flow_masks).unsqueeze(0)
-        masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-        frames, flow_masks, masks_dilated = frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(self.device)
+        # ---------- fast CPU->GPU handoff ----------
+        # The original `to_tensors()` path does per-frame PIL->bytes->transpose and is very slow for long videos.
+        # Here we stack uint8 on CPU, optionally pin it, then transfer once and normalize/cast on GPU.
+        log("prepare tensors (cpu): start")
+        ori_frames_inp = np.stack([np.asarray(f, dtype=np.uint8) for f in frames], axis=0)  # [T,H,W,3] uint8
+        flow_masks_u8 = np.stack([np.asarray(m.convert("L"), dtype=np.uint8) for m in flow_masks], axis=0)  # [T,H,W]
+        masks_dilated_u8 = np.stack([np.asarray(m.convert("L"), dtype=np.uint8) for m in masks_dilated], axis=0)  # [T,H,W]
+
+        frames_u8 = torch.from_numpy(ori_frames_inp).permute(0, 3, 1, 2).contiguous().unsqueeze(0)  # [1,T,3,H,W] u8
+        flow_masks_u8 = torch.from_numpy(flow_masks_u8).unsqueeze(1).contiguous().unsqueeze(0)  # [1,T,1,H,W] u8
+        masks_dilated_u8 = torch.from_numpy(masks_dilated_u8).unsqueeze(1).contiguous().unsqueeze(0)  # [1,T,1,H,W] u8
+        log("prepare tensors (cpu): done")
+
+        # Pin memory enables faster async H2D copies (only meaningful for CUDA).
+        if self.device.type == "cuda" and pin_memory:
+            frames_u8 = frames_u8.pin_memory()
+            flow_masks_u8 = flow_masks_u8.pin_memory()
+            masks_dilated_u8 = masks_dilated_u8.pin_memory()
+
+        log("H2D copy: start")
+        frames_u8 = frames_u8.to(self.device, non_blocking=non_blocking)
+        flow_masks_u8 = flow_masks_u8.to(self.device, non_blocking=non_blocking)
+        masks_dilated_u8 = masks_dilated_u8.to(self.device, non_blocking=non_blocking)
+        log("H2D copy: done")
+
+        log("normalize/cast on device: start")
+        # frames in [-1, 1] float32 for RAFT; masks in [0, 1] float32
+        frames = frames_u8.to(dtype=torch.float32).div_(127.5).sub_(1.0)
+        flow_masks = flow_masks_u8.to(dtype=torch.float32).div_(255.0)
+        masks_dilated = masks_dilated_u8.to(dtype=torch.float32).div_(255.0)
+        log("normalize/cast on device: done")
+
+        # Free intermediate uint8 tensors (save VRAM)
+        del frames_u8, flow_masks_u8, masks_dilated_u8
         log("moved tensors to device")
  
         ##############################################

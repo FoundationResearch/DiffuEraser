@@ -74,6 +74,46 @@ def resize_frames(frames, size=None):
     return frames
 
 def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter, frames):
+    """
+    Read mask frames from file path (video) or from in-memory decoded frames.
+    Returns dilated binary masks (PIL L) and corresponding masked images (PIL RGB).
+    """
+    # In-memory masks: list/tuple of PIL/np arrays
+    if isinstance(validation_mask, (list, tuple)):
+        mask_frames = list(validation_mask)[:n_total_frames]
+        def get_frame(i):
+            m = mask_frames[i]
+            if isinstance(m, Image.Image):
+                return m
+            return Image.fromarray(np.asarray(m))
+        masks = []
+        masked_images = []
+        for idx in range(len(mask_frames)):
+            mask = get_frame(idx).convert("L")
+            if mask.size != img_size:
+                mask = mask.resize(img_size, Image.NEAREST)
+            mask_np = np.asarray(mask)
+            m = np.array(mask_np > 0).astype(np.uint8)
+            m = cv2.erode(
+                m,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                iterations=1,
+            )
+            m = cv2.dilate(
+                m,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                iterations=mask_dilation_iter,
+            )
+
+            mask = Image.fromarray(m * 255)
+            masks.append(mask)
+
+            masked_image = np.array(frames[idx]) * (1 - (np.array(mask)[:, :, np.newaxis].astype(np.float32) / 255))
+            masked_image = Image.fromarray(masked_image.astype(np.uint8))
+            masked_images.append(masked_image)
+        return masks, masked_images
+
+    # File path mask video
     cap = cv2.VideoCapture(validation_mask)
     if not cap.isOpened():
         print("Error: Could not open mask video.")
@@ -88,26 +128,30 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
     idx = 0
     while True:
         ret, frame = cap.read()
-        if not ret:  
+        if not ret:
             break
-        if(idx >= n_total_frames):
+        if idx >= n_total_frames:
             break
-        mask = Image.fromarray(frame[...,::-1]).convert('L')
+        mask = Image.fromarray(frame[..., ::-1]).convert("L")
         if mask.size != img_size:
             mask = mask.resize(img_size, Image.NEAREST)
         mask = np.asarray(mask)
         m = np.array(mask > 0).astype(np.uint8)
-        m = cv2.erode(m,
-                    cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                    iterations=1)
-        m = cv2.dilate(m,
-                    cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                    iterations=mask_dilation_iter)
+        m = cv2.erode(
+            m,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        m = cv2.dilate(
+            m,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=mask_dilation_iter,
+        )
 
         mask = Image.fromarray(m * 255)
         masks.append(mask)
 
-        masked_image = np.array(frames[idx])*(1-(np.array(mask)[:,:,np.newaxis].astype(np.float32)/255))
+        masked_image = np.array(frames[idx]) * (1 - (np.array(mask)[:, :, np.newaxis].astype(np.float32) / 255))
         masked_image = Image.fromarray(masked_image.astype(np.uint8))
         masked_images.append(masked_image)
 
@@ -282,11 +326,18 @@ class DiffuEraser:
         self.num_inference_steps = checkpoints[ckpt][1]
         self.guidance_scale = 0
 
-    def forward(self, validation_image, validation_mask, priori, output_path,
+    def forward(
+                self,
+                validation_image,
+                validation_mask,
+                priori,
+                output_path=None,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
                 nframes=22, seed=None, revision = None, guidance_scale=None, blended=True,
                 input_fps=None,
                 empty_cache: bool = True,
+                save_video: bool = True,
+                return_frames: bool = False,
                 profile: bool = False,
                 profile_sync: bool = False,
                 profile_log_path: str = None):
@@ -506,16 +557,23 @@ class DiffuEraser:
             comp_frames.append(Image.fromarray(img))
         log("compose: comp_frames ready")
 
-        default_fps = fps
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                            default_fps, comp_frames[0].size)
-        for f in range(real_video_length):
-            img = np.array(comp_frames[f]).astype(np.uint8)
-            writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        writer.release()
-        log("compose: video written")
+        if save_video:
+            if output_path is None:
+                raise ValueError("`output_path` must be provided when `save_video=True`.")
+            default_fps = fps
+            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                default_fps, comp_frames[0].size)
+            for f in range(real_video_length):
+                img = np.array(comp_frames[f]).astype(np.uint8)
+                writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            writer.release()
+            log("compose: video written")
+        else:
+            log("compose: skip video writing (save_video=False)")
         ################################
 
+        if return_frames:
+            return comp_frames
         return output_path
             
 

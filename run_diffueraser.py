@@ -20,6 +20,23 @@ def decode_video_once(video_path: str, video_length_sec: float):
     frames = [Image.fromarray(f) for f in frames]
     return frames, fps
 
+def decode_mask_once(mask_path: str, video_length_sec: float, expected_fps: float = None, expected_frames: int = None):
+    """
+    Decode mask video once and return PIL frames + fps.
+    Optionally validate fps and truncate to expected_frames.
+    """
+    vframes, _, info = torchvision.io.read_video(
+        filename=mask_path, pts_unit="sec", end_pts=video_length_sec
+    )  # RGB, uint8 tensor [T,H,W,C]
+    fps = info["video_fps"]
+    if expected_fps is not None and abs(float(fps) - float(expected_fps)) > 1e-3:
+        raise ValueError(f"Mask fps ({fps}) != video fps ({expected_fps}). Please ensure they match.")
+    frames = list(vframes.numpy())
+    if expected_frames is not None:
+        frames = frames[:expected_frames]
+    frames = [Image.fromarray(f) for f in frames]
+    return frames, fps
+
 def main():
 
     ## input params
@@ -46,6 +63,7 @@ def main():
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile for faster repeated inference (adds warmup/compile overhead).')
     parser.add_argument('--compile_scope', type=str, default="diffueraser", choices=["diffueraser", "all"], help='Which models to torch.compile. "all" also compiles ProPainter (may be less stable).')
     parser.add_argument('--compile_mode', type=str, default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"], help='torch.compile mode.')
+    parser.add_argument('--preload_mask', action='store_true', help='Pre-decode mask video into RAM once and reuse it across stages (reduces slow disk I/O).')
     args = parser.parse_args()
                   
     if not os.path.exists(args.save_path):
@@ -125,11 +143,23 @@ def main():
         shared_frames, shared_fps = decode_video_once(args.input_video, args.video_length)
         log_step(f"decode_video_once: done (frames={len(shared_frames)}, fps={shared_fps})")
 
+    # Optionally decode mask only once as well (avoid cv2.VideoCapture twice on slow disks).
+    shared_mask_frames = None
+    if args.preload_mask and args.input_mask.endswith(("mp4", "mov", "avi", "MP4", "MOV", "AVI")) and shared_frames is not None:
+        log_step("decode_mask_once: start")
+        shared_mask_frames, _mask_fps = decode_mask_once(
+            args.input_mask,
+            args.video_length,
+            expected_fps=shared_fps,
+            expected_frames=len(shared_frames),
+        )
+        log_step(f"decode_mask_once: done (frames={len(shared_mask_frames)}, fps={_mask_fps})")
+
     ## priori (in-memory) - avoid writing/reading intermediate `priori.mp4`
     log_step("Propainter.forward: start")
     priori_frames = propainter.forward(
         args.input_video,
-        args.input_mask,
+        shared_mask_frames if shared_mask_frames is not None else args.input_mask,
         output_path=priori_path if args.save_priori_video else None,
         input_frames=shared_frames,
         input_fps=shared_fps,
@@ -152,7 +182,7 @@ def main():
     log_step("DiffuEraser.forward: start")
     video_inpainting_sd.forward(
         shared_frames if shared_frames is not None else args.input_video,
-        args.input_mask,
+        shared_mask_frames if shared_mask_frames is not None else args.input_mask,
         priori_frames,
         output_path,
                                 max_img_size = args.max_img_size, video_length=args.video_length, mask_dilation_iter=args.mask_dilation_iter,
