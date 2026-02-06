@@ -43,6 +43,9 @@ def main():
     parser.add_argument('--disable_empty_cache', action='store_true', help='Disable frequent torch.cuda.empty_cache/gc.collect calls for better throughput (may increase peak VRAM).')
     parser.add_argument('--profile', action='store_true', help='Print stage timing to help diagnose CPU/GPU stalls.')
     parser.add_argument('--profile_sync', action='store_true', help='If set, synchronize CUDA before timing points for more accurate GPU step timings (adds overhead).')
+    parser.add_argument('--compile', action='store_true', help='Enable torch.compile for faster repeated inference (adds warmup/compile overhead).')
+    parser.add_argument('--compile_scope', type=str, default="diffueraser", choices=["diffueraser", "all"], help='Which models to torch.compile. "all" also compiles ProPainter (may be less stable).')
+    parser.add_argument('--compile_mode', type=str, default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"], help='torch.compile mode.')
     args = parser.parse_args()
                   
     if not os.path.exists(args.save_path):
@@ -64,6 +67,39 @@ def main():
     ckpt = "2-Step"
     video_inpainting_sd = DiffuEraser(device, args.base_model_path, args.vae_path, args.diffueraser_path, ckpt=ckpt)
     propainter = Propainter(args.propainter_model_dir, device=device)
+
+    # Optional torch.compile (best for multi-video workloads; compile overhead amortized).
+    compile_status = {"enabled": bool(args.compile), "scope": args.compile_scope, "mode": args.compile_mode, "compiled": []}
+    if args.compile:
+        if not hasattr(torch, "compile"):
+            print("[run] WARNING: torch.compile not available in this torch build; skipping.")
+        else:
+            mode = None if args.compile_mode == "default" else args.compile_mode
+
+            def try_compile(name: str, module):
+                try:
+                    compiled = torch.compile(module, mode=mode)
+                    compile_status["compiled"].append(name)
+                    print(f"[run] torch.compile OK: {name}")
+                    return compiled
+                except Exception as e:
+                    print(f"[run] WARNING: torch.compile failed for {name}: {type(e).__name__}: {e}")
+                    return module
+
+            # DiffuEraser
+            if hasattr(video_inpainting_sd, "pipeline"):
+                if hasattr(video_inpainting_sd.pipeline, "unet"):
+                    video_inpainting_sd.pipeline.unet = try_compile("diffueraser.pipeline.unet", video_inpainting_sd.pipeline.unet)
+                if hasattr(video_inpainting_sd.pipeline, "brushnet"):
+                    video_inpainting_sd.pipeline.brushnet = try_compile("diffueraser.pipeline.brushnet", video_inpainting_sd.pipeline.brushnet)
+
+            # ProPainter (optional; can be less stable due to dynamic control flow)
+            if args.compile_scope == "all":
+                if hasattr(propainter, "model"):
+                    propainter.model = try_compile("propainter.model", propainter.model)
+                if hasattr(propainter, "fix_flow_complete"):
+                    propainter.fix_flow_complete = try_compile("propainter.fix_flow_complete", propainter.fix_flow_complete)
+
     init_t1 = time.time()
     print(f"[run] model init time: {init_t1 - init_t0:.4f} s")
     
@@ -143,6 +179,7 @@ def main():
                 f.write(f"priori_path={os.path.abspath(priori_path)}\n")
             f.write(f"disable_empty_cache={bool(args.disable_empty_cache)}\n")
             f.write(f"no_blend={bool(args.no_blend)}\n")
+            f.write(f"compile={compile_status}\n")
             f.write("----\n")
 
     torch.cuda.empty_cache()

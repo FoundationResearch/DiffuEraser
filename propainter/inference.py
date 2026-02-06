@@ -150,6 +150,9 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 class Propainter:
     def __init__(
             self, propainter_model_dir, device):
+        # Normalize device input to torch.device for robustness (callers may pass "cuda"/"cuda:0"/"cpu" strings).
+        if isinstance(device, str):
+            device = torch.device(device)
         self.device = device
         ##############################################
         # set up RAFT and flow competition model
@@ -209,7 +212,7 @@ class Propainter:
 
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
-        if self.device == torch.device('cpu'):
+        if self.device.type == 'cpu':
             use_half = False
 
         ################ read input video ################
