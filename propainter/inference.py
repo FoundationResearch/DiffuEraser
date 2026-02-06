@@ -174,7 +174,9 @@ class Propainter:
         self.model.eval()
     def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=2, height=-1, width=-1,
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
-                raft_iter=20, save_fps=24, save_frames=False, fp16=True):
+                raft_iter=20, save_fps=24, save_frames=False, fp16=True,
+                save_video: bool = True,
+                return_priori_frames: bool = False):
         
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
@@ -490,16 +492,25 @@ class Propainter:
             
             torch.cuda.empty_cache()
 
-        ##save composed video##
+        ## resize back to original (out_size) for saving / downstream usage
         comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                fps, (comp_frames[0].shape[1],comp_frames[0].shape[0]))
-        for f in range(video_length):
-            frame = comp_frames[f].astype(np.uint8)
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        writer.release()
+
+        if save_video:
+            if output_path is None:
+                raise ValueError("`output_path` must be provided when `save_video=True`.")
+            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                    fps, (comp_frames[0].shape[1], comp_frames[0].shape[0]))
+            for f in range(video_length):
+                frame = comp_frames[f].astype(np.uint8)
+                # comp_frames are RGB; swap channels to BGR for OpenCV writer
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            writer.release()
         
         torch.cuda.empty_cache()
+
+        if return_priori_frames:
+            # Return list of PIL RGB images for in-memory handoff to DiffuEraser
+            return [Image.fromarray(f.astype(np.uint8)) for f in comp_frames]
 
         return output_path
 

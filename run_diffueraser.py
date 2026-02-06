@@ -26,7 +26,6 @@ def main():
                   
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
-    priori_path = os.path.join(args.save_path, "priori.mp4")                        
     output_path = os.path.join(args.save_path, "diffueraser_result.mp4") 
     
     ## model initialization
@@ -38,14 +37,23 @@ def main():
     
     start_time = time.time()
 
-    ## priori
-    propainter.forward(args.input_video, args.input_mask, priori_path, video_length=args.video_length, 
-                        ref_stride=args.ref_stride, neighbor_length=args.neighbor_length, subvideo_length = args.subvideo_length,
-                        mask_dilation = args.mask_dilation_iter) 
+    ## priori (in-memory) - avoid writing/reading intermediate `priori.mp4`
+    priori_frames = propainter.forward(
+        args.input_video,
+        args.input_mask,
+        output_path=None,
+        video_length=args.video_length,
+        ref_stride=args.ref_stride,
+        neighbor_length=args.neighbor_length,
+        subvideo_length=args.subvideo_length,
+        mask_dilation=args.mask_dilation_iter,
+        save_video=False,
+        return_priori_frames=True,
+    )
 
     ## diffueraser
     guidance_scale = None    # The default value is 0.  
-    video_inpainting_sd.forward(args.input_video, args.input_mask, priori_path, output_path,
+    video_inpainting_sd.forward(args.input_video, args.input_mask, priori_frames, output_path,
                                 max_img_size = args.max_img_size, video_length=args.video_length, mask_dilation_iter=args.mask_dilation_iter,
                                 guidance_scale=guidance_scale)
     

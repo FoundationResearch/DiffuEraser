@@ -7,6 +7,7 @@ import torch
 import torchvision
 from einops import repeat
 from PIL import Image, ImageFilter
+from typing import List, Union
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -114,7 +115,26 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
 
     return masks, masked_images
 
-def read_priori(priori, fps, n_total_frames, img_size):
+def read_priori(
+    priori: Union[str, List[Image.Image]],
+    fps: float,
+    n_total_frames: int,
+    img_size,
+):
+    # In-memory priori frames (preferred fast path)
+    if isinstance(priori, (list, tuple)):
+        prioris = list(priori)[:n_total_frames]
+        # Ensure PIL + correct size
+        out = []
+        for img in prioris:
+            if not isinstance(img, Image.Image):
+                img = Image.fromarray(np.asarray(img))
+            if img.size != img_size:
+                img = img.resize(img_size)
+            out.append(img)
+        return out
+
+    # File path priori video
     cap = cv2.VideoCapture(priori)
     if not cap.isOpened():
         print("Error: Could not open video.")
@@ -124,22 +144,22 @@ def read_priori(priori, fps, n_total_frames, img_size):
         cap.release()
         raise ValueError("The frame rate of all input videos needs to be consistent.")
 
-    prioris=[]
+    prioris = []
     idx = 0
     while True:
         ret, frame = cap.read()
-        if not ret: 
+        if not ret:
             break
-        if(idx >= n_total_frames):
+        if idx >= n_total_frames:
             break
-        img = Image.fromarray(frame[...,::-1])
+        img = Image.fromarray(frame[..., ::-1])
         if img.size != img_size:
             img = img.resize(img_size)
         prioris.append(img)
         idx += 1
     cap.release()
 
-    os.remove(priori) # remove priori 
+    os.remove(priori)  # remove priori
 
     return prioris
 
