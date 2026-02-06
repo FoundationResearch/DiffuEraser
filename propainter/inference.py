@@ -176,7 +176,7 @@ class Propainter:
                                         model_dir=propainter_model_dir, progress=True, file_name=None)
         self.model = InpaintGenerator(model_path=ckpt_path).to(device)
         self.model.eval()
-    def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=2, height=-1, width=-1,
+    def forward(self, video, mask, output_path, resize_ratio=1.0, video_length=2, height=-1, width=-1,
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
                 raft_iter=20, save_fps=24, save_frames=False, fp16=True,
                 save_video: bool = True,
