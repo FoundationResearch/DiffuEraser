@@ -449,9 +449,11 @@ class StableDiffusionDiffuEraserPipeline(
     def decode_latents(self, latents, weight_dtype, batch_size: int = 8):
         # Batch decode for better GPU utilization (avoid per-frame kernel launch overhead)
         latents = (1 / self.vae.config.scaling_factor) * latents
+        if latents.dtype != weight_dtype:
+            latents = latents.to(weight_dtype)
         outs = []
         for i in range(0, latents.shape[0], batch_size):
-            outs.append(self.vae.decode(latents[i : i + batch_size].to(weight_dtype)).sample)
+            outs.append(self.vae.decode(latents[i : i + batch_size]).sample)
         video = torch.cat(outs, dim=0)
 
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
@@ -528,9 +530,11 @@ class StableDiffusionDiffuEraserPipeline(
     def decode_latents(self, latents, weight_dtype, batch_size: int = 8):
         # Batch decode for better GPU utilization (avoid per-frame kernel launch overhead)
         latents = (1 / self.vae.config.scaling_factor) * latents
+        if latents.dtype != weight_dtype:
+            latents = latents.to(weight_dtype)
         outs = []
         for i in range(0, latents.shape[0], batch_size):
-            outs.append(self.vae.decode(latents[i : i + batch_size].to(weight_dtype)).sample)
+            outs.append(self.vae.decode(latents[i : i + batch_size]).sample)
         video = torch.cat(outs, dim=0)
 
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
@@ -738,55 +742,29 @@ class StableDiffusionDiffuEraserPipeline(
         do_classifier_free_guidance=False,
         guess_mode=False,
     ):
-        # Fast path: common case is a list/tuple of PIL images (video frames).
-        # Avoid Python loop with per-frame `.to(device)` by doing:
-        # 1) batch preprocess on CPU
-        # 2) (optional) pin memory
-        # 3) single H2D copy
-        # 4) split back into list-of-tensors to keep downstream interface unchanged
-        if isinstance(images, (list, tuple)) and len(images) > 0 and all(not isinstance(im, torch.Tensor) for im in images):
-            images_cpu = self.image_processor.preprocess(images, height=height, width=width).to(dtype=torch.float32)  # [T,C,H,W] on CPU
-            # In this pipeline we expect each element to represent a single image (batch=1).
-            # If not, fall back to the original slow path for safety.
-            if images_cpu.dim() != 4:
-                images_cpu = None
+        # Performance-only fast path (NO fallback):
+        # We only support a list/tuple of frame-wise (PIL/np) inputs where each element is a single image.
+        # Any other input type is considered a bug and will raise, per caller guarantee.
+        if not isinstance(images, (list, tuple)) or len(images) == 0:
+            raise TypeError("`images` must be a non-empty list/tuple of per-frame images.")
+        if any(isinstance(im, torch.Tensor) for im in images):
+            raise TypeError("`images` elements must not be torch.Tensors in this optimized path.")
 
-            if images_cpu is not None:
-                repeat_by = batch_size  # each frame is a single image => repeat by batch_size
-                images_cpu = images_cpu.repeat_interleave(repeat_by, dim=0)  # [T*repeat_by,C,H,W]
+        images_cpu = self.image_processor.preprocess(images, height=height, width=width).to(dtype=torch.float32)  # [T,C,H,W] on CPU
+        if images_cpu.dim() != 4:
+            raise ValueError(f"Unexpected preprocessed tensor shape: {tuple(images_cpu.shape)}")
 
-                if device.type == "cuda":
-                    images_cpu = images_cpu.contiguous().pin_memory()
-                    images_all = images_cpu.to(device=device, dtype=dtype, non_blocking=True)
-                else:
-                    images_all = images_cpu.to(device=device, dtype=dtype)
+        repeat_by = batch_size  # each frame is a single image => repeat by batch_size
+        images_cpu = images_cpu.repeat_interleave(repeat_by, dim=0)  # [T*repeat_by,C,H,W]
 
-                # split back to list: each element is [repeat_by,C,H,W]
-                t = len(images)
-                images_new = [images_all[i * repeat_by : (i + 1) * repeat_by] for i in range(t)]
-                return images_new
+        if device.type == "cuda":
+            images_cpu = images_cpu.contiguous().pin_memory()
+            images_all = images_cpu.to(device=device, dtype=dtype, non_blocking=True)
+        else:
+            images_all = images_cpu.to(device=device, dtype=dtype)
 
-        # Slow/compatible path: preserve original behavior for odd inputs
-        images_new = []
-        for image in images:
-            image = self.image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
-            image_batch_size = image.shape[0]
-
-            if image_batch_size == 1:
-                repeat_by = batch_size
-            else:
-                # image batch size is the same as prompt batch size
-                repeat_by = num_images_per_prompt
-
-            image = image.repeat_interleave(repeat_by, dim=0)
-
-            image = image.to(device=device, dtype=dtype)
-
-            # if do_classifier_free_guidance and not guess_mode:
-            #     image = torch.cat([image] * 2)
-            images_new.append(image)
-
-        return images_new
+        t = len(images)
+        return [images_all[i * repeat_by : (i + 1) * repeat_by] for i in range(t)]
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
     def prepare_latents(self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None):
@@ -1131,11 +1109,9 @@ class StableDiffusionDiffuEraserPipeline(
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 guess_mode=guess_mode,
             )
-            original_masks_new = []
-            for original_mask in original_masks:
-                original_mask=(original_mask.sum(1)[:,None,:,:] < 0).to(images[0].dtype) 
-                original_masks_new.append(original_mask)
-            original_masks = original_masks_new
+            # Vectorized mask binarization (remove Python loop)
+            original_masks = torch.cat(original_masks, dim=0)
+            original_masks = (original_masks.sum(1, keepdim=True) < 0).to(images[0].dtype)
             
             height, width = images[0].shape[-2:]
         else:
@@ -1170,7 +1146,6 @@ class StableDiffusionDiffuEraserPipeline(
 
         conditioning_latents = conditioning_latents * self.vae.config.scaling_factor  #[(f c h w],c2=4
 
-        original_masks = torch.cat(original_masks) 
         masks = torch.nn.functional.interpolate(
             original_masks, 
             size=(

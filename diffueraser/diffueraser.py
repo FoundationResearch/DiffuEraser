@@ -497,9 +497,11 @@ class DiffuEraser:
             def decode_latents(latents, weight_dtype, batch_size: int = 8):
                 # Batch decode for better GPU utilization (avoid per-frame kernel launch overhead)
                 latents = (1 / self.vae.config.scaling_factor) * latents
+                if latents.dtype != weight_dtype:
+                    latents = latents.to(weight_dtype)
                 outs = []
                 for i in range(0, latents.shape[0], batch_size):
-                    outs.append(self.vae.decode(latents[i : i + batch_size].to(weight_dtype)).sample)
+                    outs.append(self.vae.decode(latents[i : i + batch_size]).sample)
                 video = torch.cat(outs, dim=0)
                 # keep float32 for postprocess compatibility
                 return video.float()

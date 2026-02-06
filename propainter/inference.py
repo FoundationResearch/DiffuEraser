@@ -212,8 +212,7 @@ class Propainter:
                 profile_log_path: str = None,
                 pin_memory: bool = True,
                 non_blocking: bool = True,
-                use_opencv_mask_dilate: bool = True,
-                compose_on_gpu: bool = True):
+                use_opencv_mask_dilate: bool = True):
         
         t0 = time.perf_counter()
         def log(msg: str):
@@ -237,9 +236,7 @@ class Propainter:
 
         log(f"device={self.device}, fp16={fp16}")
         if self.device.type != "cuda":
-            # GPU-only optimization; keep old path on CPU/MPS.
-            compose_on_gpu = False
-        log(f"compose_on_gpu={compose_on_gpu}")
+            raise RuntimeError("This optimized ProPainter path requires a CUDA device.")
 
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
@@ -333,12 +330,8 @@ class Propainter:
         log("normalize/cast on device: done")
 
         # Keep original uint8 frames on GPU for fast compose (avoid `.cpu()` inside the transformer loop).
-        # Otherwise free intermediates to save VRAM.
-        if compose_on_gpu:
-            ori_frames_u8 = frames_u8  # [1,T,3,H,W] uint8 on device
+        ori_frames_u8 = frames_u8  # [1,T,3,H,W] uint8 on device
         del flow_masks_u8, masks_dilated_u8
-        if not compose_on_gpu:
-            del frames_u8
         log("moved tensors to device")
  
         ##############################################
@@ -571,12 +564,9 @@ class Propainter:
                 maybe_empty_cache()
         log("image propagation done")
                 
-        if compose_on_gpu:
-            # [T,3,H,W] float32 for blending / repeated averaging
-            comp_frames_gpu = torch.zeros((video_length, 3, h, w), device=self.device, dtype=torch.float32)
-            comp_filled = torch.zeros((video_length,), device=self.device, dtype=torch.bool)
-        else:
-            comp_frames = [None] * video_length
+        # [T,3,H,W] float32 for blending / repeated averaging
+        comp_frames_gpu = torch.zeros((video_length, 3, h, w), device=self.device, dtype=torch.float32)
+        comp_filled = torch.zeros((video_length,), device=self.device, dtype=torch.bool)
 
         neighbor_stride = neighbor_length // 2
         if video_length > subvideo_length:
@@ -607,53 +597,33 @@ class Propainter:
                 pred_img = pred_img.view(-1, 3, h, w)
 
                 ## compose with input frames
-                if compose_on_gpu:
-                    # Keep everything on GPU and do one-time D2H at the end.
-                    idxs = torch.as_tensor(neighbor_ids, device=self.device, dtype=torch.long)  # [l_t]
-                    # pred in [0,255]
-                    pred_u8 = ((pred_img + 1.0) * 127.5).clamp_(0, 255).to(torch.uint8)  # [l_t,3,H,W]
-                    # original masks in {0,1}
-                    mask = (masks_dilated_ori[0, idxs, :, :, :] > 0.5).to(torch.float32)  # [l_t,1,H,W]
-                    mask3 = mask.expand(-1, 3, -1, -1)
-                    # original frames uint8
-                    ori_u8 = ori_frames_u8[0].index_select(0, idxs)  # [l_t,3,H,W]
-                    img = pred_u8.to(torch.float32) * mask3 + ori_u8.to(torch.float32) * (1.0 - mask3)  # [l_t,3,H,W]
+                # Keep everything on GPU and do one-time D2H at the end.
+                idxs = torch.as_tensor(neighbor_ids, device=self.device, dtype=torch.long)  # [l_t]
+                # pred in [0,255]
+                pred_u8 = ((pred_img + 1.0) * 127.5).clamp_(0, 255).to(torch.uint8)  # [l_t,3,H,W]
+                # original masks in {0,1}
+                mask = (masks_dilated_ori[0, idxs, :, :, :] > 0.5).to(torch.float32)  # [l_t,1,H,W]
+                mask3 = mask.expand(-1, 3, -1, -1)
+                # original frames uint8
+                ori_u8 = ori_frames_u8[0].index_select(0, idxs)  # [l_t,3,H,W]
+                img = pred_u8.to(torch.float32) * mask3 + ori_u8.to(torch.float32) * (1.0 - mask3)  # [l_t,3,H,W]
 
-                    existing = comp_frames_gpu.index_select(0, idxs)
-                    filled = comp_filled.index_select(0, idxs).view(-1, 1, 1, 1)
-                    out = torch.where(filled, existing * 0.5 + img * 0.5, img)
-                    comp_frames_gpu.index_copy_(0, idxs, out)
-                    comp_filled.index_fill_(0, idxs, True)
-                else:
-                    pred_img = (pred_img + 1) / 2
-                    pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
-                    binary_masks = masks_dilated_ori[0, neighbor_ids, :, :, :].cpu().permute(
-                        0, 2, 3, 1).numpy().astype(np.uint8)  # use original mask
-                    for i in range(len(neighbor_ids)):
-                        idx = neighbor_ids[i]
-                        img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
-                            + ori_frames_inp[idx] * (1 - binary_masks[i])
-                        if comp_frames[idx] is None:
-                            comp_frames[idx] = img
-                        else: 
-                            comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
-                            
-                        comp_frames[idx] = comp_frames[idx].astype(np.uint8)
+                existing = comp_frames_gpu.index_select(0, idxs)
+                filled = comp_filled.index_select(0, idxs).view(-1, 1, 1, 1)
+                out = torch.where(filled, existing * 0.5 + img * 0.5, img)
+                comp_frames_gpu.index_copy_(0, idxs, out)
+                comp_filled.index_fill_(0, idxs, True)
             
             maybe_empty_cache()
 
-        if compose_on_gpu:
-            log("compose_on_gpu: D2H copy start")
-            comp_u8 = comp_frames_gpu.clamp_(0, 255).to(torch.uint8)  # [T,3,H,W]
-            comp_np = comp_u8.permute(0, 2, 3, 1).contiguous().cpu().numpy()  # [T,H,W,3] uint8
-            log("compose_on_gpu: D2H copy done")
-            # Convert to list of frames (and resize) for saving / downstream usage
-            comp_frames = [cv2.resize(comp_np[i], out_size) for i in range(video_length)]
-            # free VRAM ASAP
-            del comp_frames_gpu, comp_filled, comp_u8, comp_np
-        else:
-            ## resize back to original (out_size) for saving / downstream usage
-            comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
+        log("compose_on_gpu: D2H copy start")
+        comp_u8 = comp_frames_gpu.clamp_(0, 255).to(torch.uint8)  # [T,3,H,W]
+        comp_np = comp_u8.permute(0, 2, 3, 1).contiguous().cpu().numpy()  # [T,H,W,3] uint8
+        log("compose_on_gpu: D2H copy done")
+        # Convert to list of frames (and resize) for saving / downstream usage
+        comp_frames = [cv2.resize(comp_np[i], out_size) for i in range(video_length)]
+        # free VRAM ASAP
+        del comp_frames_gpu, comp_filled, comp_u8, comp_np
 
         if save_video:
             if output_path is None:
