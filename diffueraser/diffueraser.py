@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torchvision
 import time
+import torch.nn.functional as F
 from einops import repeat
 from PIL import Image, ImageFilter
 from typing import List, Union
@@ -548,34 +549,64 @@ class DiffuEraser:
         maybe_empty_cache()
 
         ################ Compose ################
-        log(f"compose: start (blended={blended})")
-        binary_masks = validation_masks_input_ori
-        mask_blurreds = []
+        log(f"compose_gpu: start (blended={blended})")
+        dev = torch.device(self.device)
+        if dev.type != "cuda":
+            raise RuntimeError("This optimized compose path requires a CUDA device.")
+
+        # Stack everything on CPU first, then do a single H2D copy.
+        # images: output frames from pipeline (PIL list, RGB)
+        # resized_frames_ori: original resized frames (PIL list, RGB)
+        # validation_masks_input_ori: original masks (PIL list, L) in {0,255}
+        t = len(images)
+        out_imgs_np = np.stack([np.asarray(im, dtype=np.uint8) for im in images], axis=0)  # [T,H,W,3]
+        ori_np = np.stack([np.asarray(im, dtype=np.uint8) for im in resized_frames_ori[:t]], axis=0)  # [T,H,W,3]
+        mask_np = np.stack([np.asarray(m.convert("L"), dtype=np.uint8) for m in validation_masks_input_ori[:t]], axis=0)  # [T,H,W]
+
+        out_imgs = torch.from_numpy(out_imgs_np).permute(0, 3, 1, 2).contiguous()  # [T,3,H,W] u8
+        ori_imgs = torch.from_numpy(ori_np).permute(0, 3, 1, 2).contiguous()  # [T,3,H,W] u8
+        masks_u8 = torch.from_numpy(mask_np).unsqueeze(1).contiguous()  # [T,1,H,W] u8
+
+        # Pin + async copy
+        out_imgs = out_imgs.pin_memory()
+        ori_imgs = ori_imgs.pin_memory()
+        masks_u8 = masks_u8.pin_memory()
+
+        out_imgs = out_imgs.to(dev, non_blocking=True)
+        ori_imgs = ori_imgs.to(dev, non_blocking=True)
+        masks_u8 = masks_u8.to(dev, non_blocking=True)
+
+        masks = masks_u8.to(torch.float32).div_(255.0)  # [T,1,H,W] in [0,1]
         if blended:
-            # blur, you can adjust the parameters for better performance
-            for i in range(len(binary_masks)):
-                mask_blurred = cv2.GaussianBlur(np.array(binary_masks[i]), (21, 21), 0)/255.
-                binary_mask = 1-(1-np.array(binary_masks[i])/255.) * (1-mask_blurred)
-                mask_blurreds.append(Image.fromarray((binary_mask*255).astype(np.uint8)))
-            binary_masks = mask_blurreds
-        
-        comp_frames = []
-        for i in range(len(images)):
-            mask = np.expand_dims(np.array(binary_masks[i]),2).repeat(3, axis=2).astype(np.float32)/255.
-            img = (np.array(images[i]).astype(np.uint8) * mask \
-                + np.array(resized_frames_ori[i]).astype(np.uint8) * (1 - mask)).astype(np.uint8)
-            comp_frames.append(Image.fromarray(img))
-        log("compose: comp_frames ready")
+            k = 21
+            pad = k // 2
+            # Match OpenCV sigma=0 heuristic: sigma = 0.3*((k-1)*0.5 - 1) + 0.8
+            sigma = 0.3 * (((k - 1) * 0.5) - 1.0) + 0.8
+            x = torch.arange(k, device=dev, dtype=torch.float32) - (k - 1) / 2.0
+            g1 = torch.exp(-(x * x) / (2.0 * sigma * sigma))
+            g1 = g1 / g1.sum()
+            g2 = (g1[:, None] * g1[None, :]).view(1, 1, k, k)  # [1,1,k,k]
+            masks_blur = F.conv2d(masks, g2, padding=pad)
+            # binary_mask = 1 - (1-mask) * (1-mask_blur)
+            masks = 1.0 - (1.0 - masks) * (1.0 - masks_blur)
+            masks = masks.clamp_(0.0, 1.0)
+
+        masks3 = masks.expand(-1, 3, -1, -1)  # [T,3,H,W]
+        comp = out_imgs.to(torch.float32) * masks3 + ori_imgs.to(torch.float32) * (1.0 - masks3)
+        comp_u8 = comp.round().clamp_(0.0, 255.0).to(torch.uint8)  # [T,3,H,W]
+
+        log("compose_gpu: D2H copy start")
+        comp_np = comp_u8.permute(0, 2, 3, 1).contiguous().cpu().numpy()  # [T,H,W,3] uint8
+        log("compose_gpu: D2H copy done")
 
         if save_video:
             if output_path is None:
                 raise ValueError("`output_path` must be provided when `save_video=True`.")
             default_fps = fps
             writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                default_fps, comp_frames[0].size)
+                                default_fps, (comp_np[0].shape[1], comp_np[0].shape[0]))
             for f in range(real_video_length):
-                img = np.array(comp_frames[f]).astype(np.uint8)
-                writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                writer.write(cv2.cvtColor(comp_np[f], cv2.COLOR_BGR2RGB))
             writer.release()
             log("compose: video written")
         else:
@@ -583,7 +614,7 @@ class DiffuEraser:
         ################################
 
         if return_frames:
-            return comp_frames
+            return [Image.fromarray(comp_np[i]) for i in range(real_video_length)]
         return output_path
             
 
