@@ -446,16 +446,16 @@ class StableDiffusionDiffuEraserPipeline(
 
             return image_embeds, uncond_image_embeds
         
-    def decode_latents(self, latents, weight_dtype):
-        latents = 1 / self.vae.config.scaling_factor * latents
-        video = []
-        for t in range(latents.shape[0]):
-            video.append(self.vae.decode(latents[t:t+1, ...].to(weight_dtype)).sample)
-        video = torch.concat(video, dim=0)
-        
+    def decode_latents(self, latents, weight_dtype, batch_size: int = 8):
+        # Batch decode for better GPU utilization (avoid per-frame kernel launch overhead)
+        latents = (1 / self.vae.config.scaling_factor) * latents
+        outs = []
+        for i in range(0, latents.shape[0], batch_size):
+            outs.append(self.vae.decode(latents[i : i + batch_size].to(weight_dtype)).sample)
+        video = torch.cat(outs, dim=0)
+
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-        video = video.float()
-        return video
+        return video.float()
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_ip_adapter_image_embeds
     def prepare_ip_adapter_image_embeds(
@@ -525,16 +525,16 @@ class StableDiffusionDiffuEraserPipeline(
         return image, has_nsfw_concept
 
     # Copied from diffusers.pipelines.text_to_video_synthesis/pipeline_text_to_video_synth.TextToVideoSDPipeline.decode_latents
-    def decode_latents(self, latents, weight_dtype):
-        latents = 1 / self.vae.config.scaling_factor * latents
-        video = []
-        for t in range(latents.shape[0]):
-            video.append(self.vae.decode(latents[t:t+1, ...].to(weight_dtype)).sample)
-        video = torch.concat(video, dim=0)
-        
+    def decode_latents(self, latents, weight_dtype, batch_size: int = 8):
+        # Batch decode for better GPU utilization (avoid per-frame kernel launch overhead)
+        latents = (1 / self.vae.config.scaling_factor) * latents
+        outs = []
+        for i in range(0, latents.shape[0], batch_size):
+            outs.append(self.vae.decode(latents[i : i + batch_size].to(weight_dtype)).sample)
+        video = torch.cat(outs, dim=0)
+
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-        video = video.float()
-        return video
+        return video.float()
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):

@@ -417,15 +417,15 @@ class DiffuEraser:
                 ).latents
             maybe_empty_cache()
 
-            def decode_latents(latents, weight_dtype):
-                latents = 1 / self.vae.config.scaling_factor * latents
-                video = []
-                for t in range(latents.shape[0]):
-                    video.append(self.vae.decode(latents[t:t+1, ...].to(weight_dtype)).sample)
-                video = torch.concat(video, dim=0)
-                # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-                video = video.float()
-                return video
+            def decode_latents(latents, weight_dtype, batch_size: int = 8):
+                # Batch decode for better GPU utilization (avoid per-frame kernel launch overhead)
+                latents = (1 / self.vae.config.scaling_factor) * latents
+                outs = []
+                for i in range(0, latents.shape[0], batch_size):
+                    outs.append(self.vae.decode(latents[i : i + batch_size].to(weight_dtype)).sample)
+                video = torch.cat(outs, dim=0)
+                # keep float32 for postprocess compatibility
+                return video.float()
             with torch.no_grad():
                 video_tensor_temp = decode_latents(latents_pre_out, weight_dtype=torch.float16)
                 images_pre_out  = self.image_processor.postprocess(video_tensor_temp, output_type="pil")
