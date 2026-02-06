@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 import torchvision
+import time
 from einops import repeat
 from PIL import Image, ImageFilter
 from typing import List, Union
@@ -284,9 +285,27 @@ class DiffuEraser:
     def forward(self, validation_image, validation_mask, priori, output_path,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
                 nframes=22, seed=None, revision = None, guidance_scale=None, blended=True,
-                input_fps=None):
+                input_fps=None,
+                empty_cache: bool = True,
+                profile: bool = False):
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
+
+        t0 = time.perf_counter()
+        def log(msg: str):
+            if profile:
+                dt = time.perf_counter() - t0
+                print(f"[DiffuEraser][{dt:8.3f}s] {msg}")
+
+        def maybe_empty_cache():
+            if empty_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        def maybe_gc():
+            if empty_cache:
+                gc.collect()
+
+        log(f"device={self.device}, video_length={video_length}, nframes={nframes}")
 
         if (max_img_size<256 or max_img_size>1920):
             raise ValueError("The max_img_size must be larger than 256, smaller than 1920.")
@@ -296,12 +315,15 @@ class DiffuEraser:
             validation_image, video_length, nframes, max_img_size, fps_override=input_fps
         )
         video_len = len(frames)
+        log(f"video read: frames={video_len}, fps={fps}, img_size={img_size}, n_clip={n_clip}")
 
         ################     read mask    ################ 
         validation_masks_input, validation_images_input = read_mask(validation_mask, fps, video_len, img_size, mask_dilation_iter, frames)
+        log("mask read + dilation done")
   
         ################    read priori   ################  
         prioris = read_priori(priori, fps, n_total_frames, img_size)
+        log("priori ready")
 
         ## recheck
         n_total_frames = min(min(len(frames), len(validation_masks_input)), len(prioris))
@@ -360,7 +382,7 @@ class DiffuEraser:
                 latents.append(self.vae.encode(pixel_values[i : i + num]).latent_dist.sample())
             latents = torch.cat(latents, dim=0)
         latents = latents * self.vae.config.scaling_factor #[(b f), c1, h, w], c1=4
-        torch.cuda.empty_cache()  
+        maybe_empty_cache()
         timesteps = torch.tensor([0], device=self.device)
         timesteps = timesteps.long()
 
@@ -393,7 +415,7 @@ class DiffuEraser:
                     guidance_scale=guidance_scale_final,
                     latents=latents_pre,
                 ).latents
-            torch.cuda.empty_cache()  
+            maybe_empty_cache()
 
             def decode_latents(latents, weight_dtype):
                 latents = 1 / self.vae.config.scaling_factor * latents
@@ -407,7 +429,7 @@ class DiffuEraser:
             with torch.no_grad():
                 video_tensor_temp = decode_latents(latents_pre_out, weight_dtype=torch.float16)
                 images_pre_out  = self.image_processor.postprocess(video_tensor_temp, output_type="pil")
-            torch.cuda.empty_cache()  
+            maybe_empty_cache()
 
             ## replace input frames with updated frames
             black_image = Image.new('L', validation_masks_input[0].size, color=0)
@@ -419,8 +441,8 @@ class DiffuEraser:
         else:
             latents_pre_out=None
             sample_index=None
-        gc.collect()
-        torch.cuda.empty_cache()
+        maybe_gc()
+        maybe_empty_cache()
 
         ################  Frame-by-frame inference  ################
         ## add priori
@@ -439,8 +461,8 @@ class DiffuEraser:
             ).frames
         images = images[:real_video_length]
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        maybe_gc()
+        maybe_empty_cache()
 
         ################ Compose ################
         binary_masks = validation_masks_input_ori

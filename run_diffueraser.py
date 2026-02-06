@@ -37,6 +37,8 @@ def main():
     parser.add_argument('--vae_path', type=str, default="weights/sd-vae-ft-mse" , help='Path to vae')
     parser.add_argument('--diffueraser_path', type=str, default="weights/diffuEraser" , help='Path to DiffuEraser')
     parser.add_argument('--propainter_model_dir', type=str, default="weights/propainter" , help='Path to priori model')
+    parser.add_argument('--disable_empty_cache', action='store_true', help='Disable frequent torch.cuda.empty_cache/gc.collect calls for better throughput (may increase peak VRAM).')
+    parser.add_argument('--profile', action='store_true', help='Print stage timing to help diagnose CPU/GPU stalls.')
     args = parser.parse_args()
                   
     if not os.path.exists(args.save_path):
@@ -72,6 +74,8 @@ def main():
         mask_dilation=args.mask_dilation_iter,
         save_video=False,
         return_priori_frames=True,
+        empty_cache=not args.disable_empty_cache,
+        profile=args.profile,
     )
 
     ## diffueraser
@@ -84,6 +88,8 @@ def main():
                                 max_img_size = args.max_img_size, video_length=args.video_length, mask_dilation_iter=args.mask_dilation_iter,
                                 guidance_scale=guidance_scale,
                                 input_fps=shared_fps,
+                                empty_cache=not args.disable_empty_cache,
+                                profile=args.profile,
     )
     
     end_time = time.time()  
