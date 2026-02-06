@@ -340,7 +340,9 @@ class DiffuEraser:
                 return_frames: bool = False,
                 profile: bool = False,
                 profile_sync: bool = False,
-                profile_log_path: str = None):
+                profile_log_path: str = None,
+                pin_memory: bool = True,
+                non_blocking: bool = True):
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
 
@@ -431,17 +433,23 @@ class DiffuEraser:
         
         ################  prepare priori  ################
         log("prepare_priori(preprocess): start")
-        images_preprocessed = []
-        for image in prioris:
-            image = self.image_processor.preprocess(image, height=tar_height, width=tar_width).to(dtype=torch.float32)
-            image = image.to(device=torch.device(self.device), dtype=torch.float16)
-            images_preprocessed.append(image)
-        pixel_values = torch.cat(images_preprocessed)
+        # Batch preprocess on CPU + (optional) pinned memory + single H2D copy.
+        # This removes per-frame `.to(device)` overhead (many small copies).
+        dev = torch.device(self.device)
+        is_cuda = dev.type == "cuda"
+        pixel_values_cpu = self.image_processor.preprocess(prioris, height=tar_height, width=tar_width).to(dtype=torch.float32)  # [T,3,H,W] on CPU
+        if is_cuda and pin_memory:
+            pixel_values_cpu = pixel_values_cpu.contiguous().pin_memory()
+        if is_cuda:
+            pixel_values = pixel_values_cpu.to(device=dev, dtype=torch.float16, non_blocking=non_blocking)
+        else:
+            pixel_values = pixel_values_cpu.to(device=dev)
         log("prepare_priori(preprocess): done")
 
         with torch.no_grad():
             log("prepare_priori(vae.encode): start")
-            pixel_values = pixel_values.to(dtype=torch.float16)
+            if is_cuda:
+                pixel_values = pixel_values.to(dtype=torch.float16)
             latents = []
             num=4
             for i in range(0, pixel_values.shape[0], num):
