@@ -176,19 +176,35 @@ class Propainter:
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
                 raft_iter=20, save_fps=24, save_frames=False, fp16=True,
                 save_video: bool = True,
-                return_priori_frames: bool = False):
+                return_priori_frames: bool = False,
+                input_frames=None,
+                input_fps=None):
         
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
         if self.device == torch.device('cpu'):
             use_half = False
 
-        ################ read input video ################ 
-        frames, fps, size, video_name, nframes = read_frame_from_videos(video, video_length)
-        frames = frames[:nframes]
+        ################ read input video ################
+        if input_frames is not None:
+            # Use shared decoded frames (avoid decoding the same video twice).
+            frames = list(input_frames)
+            fps = input_fps
+            if fps is None:
+                fps = save_fps
+            if video_length is not None and fps is not None:
+                n_total_frames = int(video_length * fps)
+                frames = frames[:n_total_frames]
+            size = frames[0].size
+            video_name = "in_memory"
+            nframes = len(frames)
+        else:
+            frames, fps, size, video_name, nframes = read_frame_from_videos(video, video_length)
+            frames = frames[:nframes]
         if not width == -1 and not height == -1:
             size = (width, height)
 
+        orig_size = size
         longer_edge = max(size[0], size[1])
         if(longer_edge > MaxSideThresh): 
             scale = MaxSideThresh / longer_edge
@@ -197,6 +213,11 @@ class Propainter:
             size = (int(resize_ratio * size[0]), int(resize_ratio * size[1]))
 
         frames, size, out_size = resize_frames(frames, size)
+        if size != orig_size:
+            print(
+                f"[ProPainter] resize input: orig={orig_size} -> process={size} "
+                f"(out_size={out_size}, resize_ratio={resize_ratio:.4f}, MaxSideThresh={MaxSideThresh})"
+            )
         fps = save_fps if fps is None else fps
 
         ################ read mask ################ 

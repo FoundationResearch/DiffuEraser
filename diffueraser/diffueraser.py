@@ -163,14 +163,33 @@ def read_priori(
 
     return prioris
 
-def read_video(validation_image, video_length, nframes, max_img_size):
-    vframes, aframes, info = torchvision.io.read_video(filename=validation_image, pts_unit='sec', end_pts=video_length) # RGB
-    fps = info['video_fps']
-    n_total_frames = int(video_length * fps)
-    n_clip = int(np.ceil(n_total_frames/nframes))
+def read_video(validation_image, video_length, nframes, max_img_size, fps_override=None):
+    """
+    Args:
+        validation_image: path to video OR list/tuple of PIL frames (RGB).
+        fps_override: required when validation_image is in-memory frames.
+    """
+    if isinstance(validation_image, (list, tuple)):
+        if fps_override is None:
+            raise ValueError("`fps_override` must be provided when `validation_image` is in-memory frames.")
+        fps = fps_override
+        frames = list(validation_image)
+        if video_length is not None:
+            n_total_frames = min(len(frames), int(video_length * fps))
+        else:
+            n_total_frames = len(frames)
+        frames = frames[:n_total_frames]
+        n_clip = int(np.ceil(n_total_frames / nframes))
+    else:
+        vframes, _, info = torchvision.io.read_video(
+            filename=validation_image, pts_unit="sec", end_pts=video_length
+        )  # RGB
+        fps = info["video_fps"]
+        n_total_frames = int(video_length * fps)
+        n_clip = int(np.ceil(n_total_frames / nframes))
 
-    frames = list(vframes.numpy())[:n_total_frames]
-    frames = [Image.fromarray(f) for f in frames]
+        frames = list(vframes.numpy())[:n_total_frames]
+        frames = [Image.fromarray(f) for f in frames]
     max_size = max(frames[0].size)
     if(max_size<256):
         raise ValueError("The resolution of the uploaded video must be larger than 256x256.")
@@ -264,7 +283,8 @@ class DiffuEraser:
 
     def forward(self, validation_image, validation_mask, priori, output_path,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
-                nframes=22, seed=None, revision = None, guidance_scale=None, blended=True):
+                nframes=22, seed=None, revision = None, guidance_scale=None, blended=True,
+                input_fps=None):
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
 
@@ -272,7 +292,9 @@ class DiffuEraser:
             raise ValueError("The max_img_size must be larger than 256, smaller than 1920.")
 
         ################ read input video ################ 
-        frames, fps, img_size, n_clip, n_total_frames = read_video(validation_image, video_length, nframes, max_img_size)
+        frames, fps, img_size, n_clip, n_total_frames = read_video(
+            validation_image, video_length, nframes, max_img_size, fps_override=input_fps
+        )
         video_len = len(frames)
 
         ################     read mask    ################ 

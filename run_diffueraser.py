@@ -2,8 +2,23 @@ import torch
 import os 
 import time
 import argparse
+import torchvision
+from PIL import Image
 from diffueraser.diffueraser import DiffuEraser
 from propainter.inference import Propainter, get_device
+
+def decode_video_once(video_path: str, video_length_sec: float):
+    """
+    Decode video once and return PIL RGB frames + fps.
+    """
+    vframes, _, info = torchvision.io.read_video(
+        filename=video_path, pts_unit="sec", end_pts=video_length_sec
+    )  # RGB, uint8 tensor [T,H,W,C]
+    fps = info["video_fps"]
+    n_total_frames = int(video_length_sec * fps)
+    frames = list(vframes.numpy())[:n_total_frames]
+    frames = [Image.fromarray(f) for f in frames]
+    return frames, fps
 
 def main():
 
@@ -37,11 +52,19 @@ def main():
     
     start_time = time.time()
 
+    # Decode input video only once (both Propainter and DiffuEraser need frames).
+    # Fallback to old path if input is not a video file path.
+    shared_frames, shared_fps = None, None
+    if args.input_video.endswith(("mp4", "mov", "avi", "MP4", "MOV", "AVI")):
+        shared_frames, shared_fps = decode_video_once(args.input_video, args.video_length)
+
     ## priori (in-memory) - avoid writing/reading intermediate `priori.mp4`
     priori_frames = propainter.forward(
         args.input_video,
         args.input_mask,
         output_path=None,
+        input_frames=shared_frames,
+        input_fps=shared_fps,
         video_length=args.video_length,
         ref_stride=args.ref_stride,
         neighbor_length=args.neighbor_length,
@@ -53,9 +76,15 @@ def main():
 
     ## diffueraser
     guidance_scale = None    # The default value is 0.  
-    video_inpainting_sd.forward(args.input_video, args.input_mask, priori_frames, output_path,
+    video_inpainting_sd.forward(
+        shared_frames if shared_frames is not None else args.input_video,
+        args.input_mask,
+        priori_frames,
+        output_path,
                                 max_img_size = args.max_img_size, video_length=args.video_length, mask_dilation_iter=args.mask_dilation_iter,
-                                guidance_scale=guidance_scale)
+                                guidance_scale=guidance_scale,
+                                input_fps=shared_fps,
+    )
     
     end_time = time.time()  
     inference_time = end_time - start_time  
