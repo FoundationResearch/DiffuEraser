@@ -212,7 +212,10 @@ class Propainter:
                 profile_log_path: str = None,
                 pin_memory: bool = True,
                 non_blocking: bool = True,
-                use_opencv_mask_dilate: bool = True):
+                use_opencv_mask_dilate: bool = True,
+                max_side_thresh: int = MaxSideThresh,
+                raft_clip_len: int = 0,
+                enable_preprop: bool = False):
         
         t0 = time.perf_counter()
         def log(msg: str):
@@ -268,8 +271,8 @@ class Propainter:
 
         orig_size = size
         longer_edge = max(size[0], size[1])
-        if(longer_edge > MaxSideThresh): 
-            scale = MaxSideThresh / longer_edge
+        if(longer_edge > max_side_thresh): 
+            scale = max_side_thresh / longer_edge
             resize_ratio = resize_ratio * scale
         if not resize_ratio == 1.0:
             size = (int(resize_ratio * size[0]), int(resize_ratio * size[1]))
@@ -278,7 +281,7 @@ class Propainter:
         if size != orig_size:
             print(
                 f"[ProPainter] resize input: orig={orig_size} -> process={size} "
-                f"(out_size={out_size}, resize_ratio={resize_ratio:.4f}, MaxSideThresh={MaxSideThresh})"
+                f"(out_size={out_size}, resize_ratio={resize_ratio:.4f}, MaxSideThresh={max_side_thresh})"
             )
         log(f"after resize: process_size={size}, out_size={out_size}")
         fps = save_fps if fps is None else fps
@@ -345,14 +348,17 @@ class Propainter:
         with torch.no_grad():
             # ---- compute flow ----
             new_longer_edge = max(frames.size(-1), frames.size(-2))
-            if new_longer_edge <= 640: 
-                short_clip_len = 12
-            elif new_longer_edge <= 720: 
-                short_clip_len = 8
-            elif new_longer_edge <= 1280:
-                short_clip_len = 4
+            if raft_clip_len and int(raft_clip_len) > 0:
+                short_clip_len = int(raft_clip_len)
             else:
-                short_clip_len = 2
+                if new_longer_edge <= 640: 
+                    short_clip_len = 12
+                elif new_longer_edge <= 720: 
+                    short_clip_len = 8
+                elif new_longer_edge <= 1280:
+                    short_clip_len = 4
+                else:
+                    short_clip_len = 2
 
             # use fp32 for RAFT
             if frames.size(1) > short_clip_len:
@@ -419,9 +425,9 @@ class Propainter:
                 
 
             masks_dilated_ori = masks_dilated.clone()
-            # ---- Pre-propagation ----
+            # ---- Pre-propagation (optional; expensive on long videos) ----
             subvideo_length_img_prop = min(100, subvideo_length) # ensure a minimum of 100 frames for image propagation
-            if(len(frames[0]))>subvideo_length_img_prop: # perform propagation only when length of frames is larger than subvideo_length_img_prop
+            if enable_preprop and (len(frames[0]) > subvideo_length_img_prop):
                 sample_rate = len(frames[0])//(subvideo_length_img_prop//2)
                 index_sample =  list(range(0, len(frames[0]), sample_rate))
                 sample_frames =  torch.stack([frames[0][i].to(torch.float32) for i in index_sample]).unsqueeze(0) # use fp32 for RAFT

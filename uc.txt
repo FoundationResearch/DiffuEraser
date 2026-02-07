@@ -4,4 +4,4 @@ python run_diffueraser.py \
   --video_length 2 \
   --save_path results/profile_steps \
   --profile --profile_sync \
-  --save_priori_video
+  --raft_clip_len 16

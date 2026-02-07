@@ -53,6 +53,11 @@ def main():
     parser.add_argument('--ref_stride', type=int, default=10, help='Propainter params')
     parser.add_argument('--neighbor_length', type=int, default=10, help='Propainter params')
     parser.add_argument('--subvideo_length', type=int, default=50, help='Propainter params')
+    parser.add_argument('--raft_iter', type=int, default=20, help='ProPainter RAFT iteration count (lower=faster, lower flow quality).')
+    parser.add_argument('--raft_clip_len', type=int, default=0, help='ProPainter RAFT clip length override (0=auto). Larger can be faster if VRAM allows.')
+    parser.add_argument('--propainter_max_side', type=int, default=960, help='ProPainter max side threshold (lower=faster).')
+    parser.add_argument('--enable_preprop', action='store_true', help='Enable ProPainter pre-propagation (extra RAFT/flow compute; usually slower).')
+    parser.add_argument('--enable_tf32', action='store_true', help='Enable TF32 matmul/cudnn for speed (slight numeric differences).')
     parser.add_argument('--base_model_path', type=str, default="weights/stable-diffusion-v1-5" , help='Path to sd1.5 base model')
     parser.add_argument('--vae_path', type=str, default="weights/sd-vae-ft-mse" , help='Path to vae')
     parser.add_argument('--diffueraser_path', type=str, default="weights/diffuEraser" , help='Path to DiffuEraser')
@@ -82,6 +87,10 @@ def main():
     ## model initialization
     init_t0 = time.time()
     device = get_device()
+    if args.enable_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     # PCM params
     ckpt = "2-Step"
     video_inpainting_sd = DiffuEraser(device, args.base_model_path, args.vae_path, args.diffueraser_path, ckpt=ckpt)
@@ -168,6 +177,10 @@ def main():
         ref_stride=args.ref_stride,
         neighbor_length=args.neighbor_length,
         subvideo_length=args.subvideo_length,
+        raft_iter=args.raft_iter,
+        raft_clip_len=args.raft_clip_len,
+        max_side_thresh=args.propainter_max_side,
+        enable_preprop=bool(args.enable_preprop),
         mask_dilation=args.mask_dilation_iter,
         save_video=False,
         return_priori_frames=True,
