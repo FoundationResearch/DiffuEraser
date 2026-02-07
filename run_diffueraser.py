@@ -65,16 +65,17 @@ def main():
     parser.add_argument('--compile_mode', type=str, default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"], help='torch.compile mode.')
     parser.add_argument('--preload_mask', action='store_true', help='Pre-decode mask video into RAM once and reuse it across stages (reduces slow disk I/O).')
     args = parser.parse_args()
+
+    # Performance-only pipeline: forbid writing priors to disk.
+    if args.save_priori_video:
+        raise ValueError("`--save_priori_video` is disabled. Priors must stay on GPU (no disk).")
                   
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
-    priori_path = os.path.join(args.save_path, "priori.mp4")
     output_path = os.path.join(args.save_path, args.output_name)
     profile_log_path = os.path.join(args.save_path, "profile.log")
     print(f"[run] save_path={os.path.abspath(args.save_path)}")
     print(f"[run] output_path={os.path.abspath(output_path)}")
-    if args.save_priori_video:
-        print(f"[run] priori_path={os.path.abspath(priori_path)}")
     if args.profile:
         print(f"[run] profile_log={os.path.abspath(profile_log_path)}")
     
@@ -155,12 +156,12 @@ def main():
         )
         log_step(f"decode_mask_once: done (frames={len(shared_mask_frames)}, fps={_mask_fps})")
 
-    ## priori (in-memory) - avoid writing/reading intermediate `priori.mp4`
+    ## priori (GPU tensor) - no disk I/O
     log_step("Propainter.forward: start")
-    priori_frames = propainter.forward(
+    priori_tensor = propainter.forward(
         args.input_video,
         shared_mask_frames if shared_mask_frames is not None else args.input_mask,
-        output_path=priori_path if args.save_priori_video else None,
+        output_path=None,
         input_frames=shared_frames,
         input_fps=shared_fps,
         video_length=args.video_length,
@@ -168,14 +169,14 @@ def main():
         neighbor_length=args.neighbor_length,
         subvideo_length=args.subvideo_length,
         mask_dilation=args.mask_dilation_iter,
-        save_video=args.save_priori_video,
+        save_video=False,
         return_priori_frames=True,
         empty_cache=not args.disable_empty_cache,
         profile=args.profile,
         profile_sync=args.profile_sync,
         profile_log_path=profile_log_path,
     )
-    log_step(f"Propainter.forward: done (priori_frames={len(priori_frames)})")
+    log_step(f"Propainter.forward: done (priori_tensor={tuple(priori_tensor.shape)}, dtype={priori_tensor.dtype}, device={priori_tensor.device})")
 
     ## diffueraser
     guidance_scale = None    # The default value is 0.  
@@ -183,7 +184,7 @@ def main():
     video_inpainting_sd.forward(
         shared_frames if shared_frames is not None else args.input_video,
         shared_mask_frames if shared_mask_frames is not None else args.input_mask,
-        priori_frames,
+        priori_tensor,
         output_path,
                                 max_img_size = args.max_img_size, video_length=args.video_length, mask_dilation_iter=args.mask_dilation_iter,
                                 guidance_scale=guidance_scale,
@@ -205,8 +206,6 @@ def main():
             f.write(f"e2e_excl_init_sec={inference_time:.6f}\n")
             f.write(f"save_path={os.path.abspath(args.save_path)}\n")
             f.write(f"output_path={os.path.abspath(output_path)}\n")
-            if args.save_priori_video:
-                f.write(f"priori_path={os.path.abspath(priori_path)}\n")
             f.write(f"disable_empty_cache={bool(args.disable_empty_cache)}\n")
             f.write(f"no_blend={bool(args.no_blend)}\n")
             f.write(f"compile={compile_status}\n")

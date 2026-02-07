@@ -386,21 +386,43 @@ class DiffuEraser:
         validation_masks_input, validation_images_input = read_mask(validation_mask, fps, video_len, img_size, mask_dilation_iter, frames)
         log("read_mask: done")
   
-        ################    read priori   ################  
-        log("read_priori: start")
-        prioris = read_priori(priori, fps, n_total_frames, img_size)
-        log(f"read_priori: done (frames={len(prioris)})")
+        ################    read priori (GPU tensor)   ################
+        log("read_priori(gpu_tensor): start")
+        if isinstance(priori, str):
+            raise ValueError("Passing priori as a file path is disabled. Provide a CUDA torch.Tensor instead.")
+        if not torch.is_tensor(priori):
+            raise TypeError(f"`priori` must be a CUDA torch.Tensor [T,3,H,W] uint8. Got {type(priori)}")
+        if priori.device.type != "cuda":
+            raise ValueError(f"`priori` must be on CUDA. Got device={priori.device}")
+        if priori.dtype != torch.uint8:
+            raise ValueError(f"`priori` must be torch.uint8 in [0,255]. Got dtype={priori.dtype}")
+        if priori.ndim != 4 or priori.shape[1] != 3:
+            raise ValueError(f"`priori` must have shape [T,3,H,W]. Got {tuple(priori.shape)}")
+
+        # Ensure same device
+        dev = torch.device(self.device)
+        if dev.type != "cuda":
+            raise RuntimeError("This optimized DiffuEraser path requires a CUDA device.")
+        if priori.device != dev:
+            priori = priori.to(dev, non_blocking=True)
+
+        # Validate spatial size matches DiffuEraser input size
+        exp_w, exp_h = img_size  # PIL size (W,H)
+        if int(priori.shape[-1]) != int(exp_w) or int(priori.shape[-2]) != int(exp_h):
+            raise ValueError(
+                f"`priori` spatial size mismatch: got (H,W)=({priori.shape[-2]},{priori.shape[-1]}), expected (H,W)=({exp_h},{exp_w})."
+            )
+        log(f"read_priori(gpu_tensor): done (frames={int(priori.shape[0])})")
 
         ## recheck
-        n_total_frames = min(min(len(frames), len(validation_masks_input)), len(prioris))
+        n_total_frames = min(min(len(frames), len(validation_masks_input)), int(priori.shape[0]))
         if(n_total_frames<22):
             raise ValueError("The effective video duration is too short. Please make sure that the number of frames of video, mask, and priori is at least greater than 22 frames.")
         validation_masks_input = validation_masks_input[:n_total_frames]
         validation_images_input = validation_images_input[:n_total_frames]
         frames = frames[:n_total_frames]
-        prioris = prioris[:n_total_frames]
+        priori = priori[:n_total_frames]
 
-        prioris = resize_frames(prioris)
         validation_masks_input = resize_frames(validation_masks_input)
         validation_images_input = resize_frames(validation_images_input)
         resized_frames = resize_frames(frames)
@@ -433,24 +455,13 @@ class DiffuEraser:
         noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=n_clip)[:real_video_length,...]
         
         ################  prepare priori  ################
-        log("prepare_priori(preprocess): start")
-        # Batch preprocess on CPU + (optional) pinned memory + single H2D copy.
-        # This removes per-frame `.to(device)` overhead (many small copies).
-        dev = torch.device(self.device)
-        is_cuda = dev.type == "cuda"
-        pixel_values_cpu = self.image_processor.preprocess(prioris, height=tar_height, width=tar_width).to(dtype=torch.float32)  # [T,3,H,W] on CPU
-        if is_cuda and pin_memory:
-            pixel_values_cpu = pixel_values_cpu.contiguous().pin_memory()
-        if is_cuda:
-            pixel_values = pixel_values_cpu.to(device=dev, dtype=torch.float16, non_blocking=non_blocking)
-        else:
-            pixel_values = pixel_values_cpu.to(device=dev)
-        log("prepare_priori(preprocess): done")
+        log("prepare_priori(gpu_tensor->pixel_values): start")
+        # Convert uint8 [0,255] to float [-1,1] expected by VAE
+        pixel_values = priori.to(dtype=torch.float16).div_(127.5).sub_(1.0)  # [T,3,H,W] on CUDA
+        log("prepare_priori(gpu_tensor->pixel_values): done")
 
         with torch.no_grad():
             log("prepare_priori(vae.encode): start")
-            if is_cuda:
-                pixel_values = pixel_values.to(dtype=torch.float16)
             latents = []
             num=4
             for i in range(0, pixel_values.shape[0], num):

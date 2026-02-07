@@ -237,6 +237,9 @@ class Propainter:
         log(f"device={self.device}, fp16={fp16}")
         if self.device.type != "cuda":
             raise RuntimeError("This optimized ProPainter path requires a CUDA device.")
+        # Performance-only: forbid writing priors to disk.
+        if save_video or output_path is not None:
+            raise RuntimeError("Saving ProPainter priors to disk is disabled. Do not pass `--save_priori_video`.")
 
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
@@ -616,34 +619,16 @@ class Propainter:
             
             maybe_empty_cache()
 
-        log("compose_on_gpu: D2H copy start")
-        comp_u8 = comp_frames_gpu.clamp_(0, 255).to(torch.uint8)  # [T,3,H,W]
-        comp_np = comp_u8.permute(0, 2, 3, 1).contiguous().cpu().numpy()  # [T,H,W,3] uint8
-        log("compose_on_gpu: D2H copy done")
-        # Convert to list of frames (and resize) for saving / downstream usage
-        comp_frames = [cv2.resize(comp_np[i], out_size) for i in range(video_length)]
-        # free VRAM ASAP
-        del comp_frames_gpu, comp_filled, comp_u8, comp_np
-
-        if save_video:
-            if output_path is None:
-                raise ValueError("`output_path` must be provided when `save_video=True`.")
-            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                    fps, (comp_frames[0].shape[1], comp_frames[0].shape[0]))
-            for f in range(video_length):
-                frame = comp_frames[f].astype(np.uint8)
-                # comp_frames are RGB; swap channels to BGR for OpenCV writer
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            writer.release()
-        
+        # Return GPU tensor priors (avoid any D2H here). Shape: [T,3,H,W] uint8, in RGB.
+        comp_u8 = comp_frames_gpu.clamp_(0, 255).to(torch.uint8)  # [T,3,H,W] on CUDA
+        del comp_frames_gpu, comp_filled
         maybe_empty_cache()
         log("done")
 
         if return_priori_frames:
-            # Return list of PIL RGB images for in-memory handoff to DiffuEraser
-            return [Image.fromarray(f.astype(np.uint8)) for f in comp_frames]
+            return comp_u8
 
-        return output_path
+        return None
 
 
 
